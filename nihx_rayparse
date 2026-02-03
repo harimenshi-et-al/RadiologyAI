@@ -1,0 +1,62 @@
+import os
+import shutil
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+# Paths
+src_img = r"C:\Users\nexus\Documents\radiology images 20k"
+csv_path = r"C:\Users\nexus\Documents\Data_Entry_2017.csv"
+base_dest = r"C:\Users\nexus\Documents\Radiology_v3"
+
+# NIH Label : Folder Name
+categories = {
+    'No Finding': 'normal', 'Pneumonia': 'pneumonia', 'Mass': 'mass',
+    'Effusion': 'effusion', 'Edema': 'edema', 'Fibrosis': 'fibrosis',
+    'Atelectasis': 'atelectasis'
+}
+splits = ['train', 'val', 'test']
+
+# 1. Clean and Create Folders
+if os.path.exists(base_dest):
+    shutil.rmtree(base_dest)
+
+for s in splits:
+    for c in categories.values():
+        os.makedirs(os.path.join(base_dest, s, c), exist_ok=True)
+
+# 2. Load and Filter
+df = pd.read_csv(csv_path)
+allowed = list(categories.keys())
+
+def get_primary_label(label_string, allowed_list):
+    labels = label_string.split('|')
+    for l in labels:
+        if l in allowed_list: return l
+    return None
+
+df['target_label'] = df['Finding Labels'].apply(lambda x: get_primary_label(x, allowed))
+df = df[df['target_label'].notna()].copy()
+df['target_folder'] = df['target_label'].map(categories)
+
+# 3. Balance for 3060 Ti (Capped at 5k per class)
+MAX_PER_CLASS = 5000
+df = (
+    df.groupby('target_folder')
+      .apply(lambda x: x.sample(min(len(x), MAX_PER_CLASS), random_state=42))
+      .reset_index(drop=True)
+)
+
+# 4. Verify File Existence
+df = df[df['Image Index'].apply(lambda x: os.path.exists(os.path.join(src_img, x)))]
+
+# 5. Split 70/15/15
+train, temp = train_test_split(df, test_size=0.3, stratify=df['target_folder'], random_state=42)
+val, test = train_test_split(temp, test_size=0.5, stratify=temp['target_folder'], random_state=42)
+
+# 6. Copy Files
+print("Copying files to NVMe...")
+for data, s_name in zip([train, val, test], splits):
+    for _, row in data.iterrows():
+        shutil.copy(os.path.join(src_img, row['Image Index']),
+                    os.path.join(base_dest, s_name, row['target_folder'], row['Image Index']))
+print(f"\nDone! Dataset ready at: {base_dest}")
