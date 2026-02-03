@@ -1,0 +1,211 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import time
+import os
+import torch.nn.functional as F
+
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import confusion_matrix
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import datasets, transforms, models
+from PIL import Image
+from torchcam.methods import SmoothGradCAMpp
+from torchcam.utils import overlay_mask
+from torchvision.transforms.functional import to_pil_image
+from torchvision.models import densenet121, DenseNet121_Weights
+
+# ----------------< Environment Module >--------------------------------------------------------------------------------
+def main():
+    data_dir = r"C:\Users\nexus\Documents\Radiology_v3"
+    start_time = time.time()
+
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(256, scale=(0.9, 1.0)),
+        transforms.RandomRotation(7),
+        transforms.GaussianBlur(3, sigma=(0.1, 1.0)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    # Apply them
+    train_dataset = datasets.ImageFolder(f"{data_dir}/train", transform=train_transform)
+    test_dataset = datasets.ImageFolder(f"{data_dir}/test", transform=val_transform)
+    val_dataset = datasets.ImageFolder(f"{data_dir}/val", transform=val_transform)
+
+    print("Classes:", train_dataset.classes)
+    class_names = train_dataset.classes
+    num_classes = len(class_names)
+
+    #varibalistic weight calculation and optimizatoin
+    y_train_indices = train_dataset.targets
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(y_train_indices),
+        y=y_train_indices
+    )
+    weights = torch.tensor(class_weights, dtype=torch.float)
+
+    #train loaders
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True) #num_w facilitates background prcesses
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False )#originally was 32, reducing to update faster
+
+    # ----------------< Setup Module >--------------------------------------------------------------------------------------
+    model = densenet121(weights=DenseNet121_Weights.DEFAULT)
+    num_ftrs = model.classifier.in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.5), #was 0.2 and now changed for fine tuning
+        nn.Linear(num_ftrs, num_classes)
+    )
+    model = model.cuda()
+    for name, param in model.features.named_parameters():
+        if "denseblock4" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.Adam([{'params': model.features.denseblock4.parameters(), 'lr': 1e-5},{'params': model.classifier.parameters(), 'lr': 1e-4}])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.1)
+    # ----------------< Save States >---------------------------------------------------------------------------------------
+    checkpoint_path = "radiology_model_checkpoint.pth"
+    start_epoch = 0
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming from epoch {start_epoch}")
+    # ----------------< Training Module >-----------------------------------------------------------------------------------
+    num_epochs = 20
+    for epoch in range(start_epoch, num_epochs):
+        if epoch == 7:
+            for name, param in model.features.named_parameters():
+                if "denseblock4" in name:
+                    param.requires_grad = True
+
+            optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-5)
+        model.train()
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to("cuda"), labels.to("cuda")
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * inputs.size(0)
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+
+        model.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to("cuda"), labels.to("cuda")
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item() * inputs.size(0)
+
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        avg_val_loss = val_loss / len(val_loader.dataset)
+        val_accuracy = 100 * correct / total
+
+        scheduler.step(avg_val_loss)
+
+        # Loss and Accuracy shown as percentages / this doesnt work just yet, maybe ill fix it
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        print(f"Train Loss: {epoch_loss * 100:.2f}% | Val Loss: {avg_val_loss * 100:.2f}% | Val Acc: {val_accuracy:.2f}%")
+
+        # saving of the checkpoints
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': epoch_loss,
+        }, "radiology_model_checkpoint.pth")
+
+    # ----------------< CM Module >-----------------------------------------------------------------------------------------
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to("cuda"), labels.to("cuda")
+            outputs = model(inputs)
+            all_preds.append(torch.argmax(outputs, dim=1).cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+
+    cm = confusion_matrix(np.concatenate(all_labels), np.concatenate(all_preds))
+    cm_percent = cm.astype(float) / cm.sum(axis=1, keepdims=True) * 100
+
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt=".1f", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+    plt.title(f"Confusion Matrix ({len(class_names)} Classes)")
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.show()
+
+    # ----------------< Grad-CAM Module >-----------------------------------------------------------------------------------
+    indices = range(len(test_dataset) - 25, len(test_dataset))
+    all_visualizations = []
+
+    cam_extractor = SmoothGradCAMpp(model, target_layer='features.denseblock4')
+    model.eval()
+
+    for i, idx in enumerate(indices):
+        img_path, _ = test_dataset.samples[idx]
+        original_pil = Image.open(img_path).convert("RGB")
+        viz_original = original_pil.resize((256, 256))  # Match new transform size
+        input_tensor = val_transform(original_pil).unsqueeze(0).cuda()
+
+        out = model(input_tensor)
+        probs = F.softmax(out, dim=1)
+        conf, pred_idx = torch.max(probs, dim=1)
+        pred_class = test_dataset.classes[pred_idx.item()]
+
+        act_map = cam_extractor(pred_idx.item(), out)
+
+        # Simple color map fallback if class missing
+        color_map = {'normal': 'Purples', 'mass': 'jet', 'effusion': 'plasma', 'edema': 'gnuplot2', 'atelectasis': 'viridis'}
+        cmap = color_map.get(pred_class, 'jet')
+
+        result_pil = overlay_mask(
+            viz_original,
+            to_pil_image(act_map[0].squeeze(0), mode='F'),
+            alpha=0.5,
+            colormap=cmap
+        )
+        combined = np.hstack((np.array(viz_original), np.array(result_pil)))
+        all_visualizations.append((combined, f"Pred: {pred_class} ({conf.item():.2%})"))
+
+    # visualization
+    fig, axes = plt.subplots(5, 5, figsize=(20, 20))
+    axes = axes.flatten()
+    for idx, (img, title) in enumerate(all_visualizations):
+        axes[idx].imshow(img)
+        axes[idx].set_title(title, fontsize=10)
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+    cam_extractor.remove_hooks()
+    print(f"Finished in {(time.time() - start_time) / 60:.2f} minutes")
+
+if __name__ == '__main__': main()
