@@ -4,15 +4,12 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 # Paths
-src_img = r"C:\Users\nexus\Documents\radiology images 20k"
+src_img = r"C:\Users\nexus\Documents\radiology images 100k"
 csv_path = r"C:\Users\nexus\Documents\Data_Entry_2017.csv"
 base_dest = r"C:\Users\nexus\Documents\Radiology_v3"
 
 # NIH Label : Folder Name
-categories = {
-    'No Finding': 'normal', 'Pneumonia': 'pneumonia', 'Mass': 'mass',
-    'Effusion': 'effusion', 'Edema': 'edema', 'Fibrosis': 'fibrosis',
-    'Atelectasis': 'atelectasis'
+categories = {'No Finding': 'normal', 'Pneumonia': 'pneumonia', 'Mass': 'mass', 'Effusion': 'effusion', 'Edema': 'edema', 'Fibrosis': 'fibrosis', 'Atelectasis': 'atelectasis'
 }
 splits = ['train', 'val', 'test']
 
