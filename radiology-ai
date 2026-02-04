@@ -24,9 +24,11 @@ def main():
     start_time = time.time()
 
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(256, scale=(0.9, 1.0)),
-        transforms.RandomRotation(7),
-        transforms.GaussianBlur(3, sigma=(0.1, 1.0)),
+        transforms.RandomResizedCrop(256, scale=(0.7, 1.0)),  # More aggressive
+        transforms.RandomHorizontalFlip(p=0.5),  # brought flip variation
+        transforms.RandomRotation(15),  # Increased from 7
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),  # brought back color variation
+        transforms.GaussianBlur(3, sigma=(0.1, 2.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -55,10 +57,12 @@ def main():
     )
     weights = torch.tensor(class_weights, dtype=torch.float)
 
+    sample_weights = [weights[t] for t in train_dataset.targets]
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
     #train loaders
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True) #num_w facilitates background prcesses
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False )#originally was 32, reducing to update faster
+    train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False )
 
     # ----------------< Setup Module >--------------------------------------------------------------------------------------
     model = densenet121(weights=DenseNet121_Weights.DEFAULT)
@@ -69,14 +73,14 @@ def main():
     )
     model = model.cuda()
     for name, param in model.features.named_parameters():
-        if "denseblock4" in name:
+        if "denseblock4" in name or "transition3" in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = optim.Adam([{'params': model.features.denseblock4.parameters(), 'lr': 1e-5},{'params': model.classifier.parameters(), 'lr': 1e-4}])
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.1)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, cooldown=2, factor=0.1)
     # ----------------< Save States >---------------------------------------------------------------------------------------
     checkpoint_path = "radiology_model_checkpoint.pth"
     start_epoch = 0
@@ -86,15 +90,14 @@ def main():
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         print(f"Resuming from epoch {start_epoch}")
-    # ----------------< Training Module >-----------------------------------------------------------------------------------
-    num_epochs = 20
-    for epoch in range(start_epoch, num_epochs):
-        if epoch == 7:
-            for name, param in model.features.named_parameters():
-                if "denseblock4" in name:
-                    param.requires_grad = True
 
-            optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-5)
+    # ----------------< Early Stopping Module >-------------------------------------------------------------------------
+    best_val_loss = float('inf')
+    patience_counter = 0
+    patience = 10
+    # ----------------< Training Module >-------------------------------------------------------------------------------
+    num_epochs = 50
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
         for inputs, labels in train_loader:
@@ -120,6 +123,7 @@ def main():
                 loss = criterion(outputs, labels)
                 val_loss += loss.item() * inputs.size(0)
 
+                # Calculate Accuracy
                 _, predicted = torch.max(outputs, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
@@ -129,19 +133,29 @@ def main():
 
         scheduler.step(avg_val_loss)
 
-        # Loss and Accuracy shown as percentages / this doesnt work just yet, maybe ill fix it
+        # Loss and Accuracy, jibrils interface developer interface -----------------------------------------------------
         print(f"Epoch {epoch + 1}/{num_epochs}")
-        print(f"Train Loss: {epoch_loss * 100:.2f}% | Val Loss: {avg_val_loss * 100:.2f}% | Val Acc: {val_accuracy:.2f}%")
+        print(f"Train Loss: {epoch_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}%")
 
-        # saving of the checkpoints
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': epoch_loss,
-        }, "radiology_model_checkpoint.pth")
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'loss': epoch_loss, }, "best_model.pth")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"No major improvement observed, early stopping at epoch: {epoch + 1}. Best val loss: {best_val_loss:.4f}")
+                break
 
-    # ----------------< CM Module >-----------------------------------------------------------------------------------------
+        # Save states
+        torch.save({'epoch': epoch,'model_state_dict': model.state_dict(),'optimizer_state_dict': optimizer.state_dict(), 'loss': epoch_loss,}, "radiology_model_checkpoint.pth")
+
+    # Now reload best checkpoint for future use
+    print(f"Currently loading best model available")
+    best_checkpoint = torch.load("best_model.pth")
+    model.load_state_dict(best_checkpoint['model_state_dict'])
+
+    # ----------------< CM Module >-------------------------------------------------------------------------------------
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -156,7 +170,7 @@ def main():
 
 
     plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt=".1f", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+    sns.heatmap(cm_percent, annot=True, fmt=".0f", cmap="Blues", xticklabels=class_names, yticklabels=class_names) #.1
     plt.title(f"Confusion Matrix ({len(class_names)} Classes)")
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
@@ -195,7 +209,7 @@ def main():
         combined = np.hstack((np.array(viz_original), np.array(result_pil)))
         all_visualizations.append((combined, f"Pred: {pred_class} ({conf.item():.2%})"))
 
-    # visualization
+    # Visualization Plot
     fig, axes = plt.subplots(5, 5, figsize=(20, 20))
     axes = axes.flatten()
     for idx, (img, title) in enumerate(all_visualizations):
