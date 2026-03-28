@@ -17,11 +17,7 @@ from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
 from torchvision.transforms.functional import to_pil_image
 from torchcam.methods import SmoothGradCAMpp
 from torchcam.utils import overlay_mask
-from sklearn.metrics import (
-    confusion_matrix, classification_report,
-    roc_auc_score, roc_curve, average_precision_score,
-    cohen_kappa_score
-)
+from sklearn.metrics import (confusion_matrix, classification_report, roc_auc_score, roc_curve, average_precision_score, cohen_kappa_score)
 
 
 # ----------------< One-Time Preprocessing Module >---------------------------------------------------------------------
@@ -97,7 +93,7 @@ class XrayDataset(Dataset):
 # ----------------< Focal Loss Module >---------------------------------------------------------------------------------
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.5, label_smoothing=0.0, reduction='mean'):
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.0, reduction='mean'):
         super(FocalLoss, self).__init__()
         self.alpha           = alpha
         self.gamma           = gamma
@@ -165,13 +161,13 @@ def compute_and_save_metrics(model, test_loader, class_names, checkpoint_dir,
 
     all_preds  = np.concatenate(all_preds)
     all_labels = np.concatenate(all_labels)
-    all_probs  = np.concatenate(all_probs)   # shape: [N, num_classes]
+    all_probs  = np.concatenate(all_probs) 
 
     # ── Accuracy ──────────────────────────────────────────────────────
     overall_acc = 100 * np.mean(all_preds == all_labels)
     print(f"\nOverall Test Accuracy : {overall_acc:.2f}%")
 
-    # ── Classification Report (F1 / Precision / Recall per class) ────
+    # ── Classification Report
     print("\nClassification Report:")
     print(classification_report(all_labels, all_preds,
                                  target_names=class_names, digits=4))
